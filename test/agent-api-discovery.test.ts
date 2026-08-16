@@ -36,7 +36,11 @@ async function start() {
 
 const capFor = (
   actorId: string,
-  opts: { memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] }; liveActor?: boolean } = {},
+  opts: {
+    memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] };
+    liveActor?: boolean;
+    grants?: string[];
+  } = {},
 ) =>
   mintCapabilityToken(
     {
@@ -45,6 +49,7 @@ const capFor = (
       exp: Date.now() + CAPABILITY_TTL_MS,
       ...(opts.memory ? { memory: opts.memory } : {}),
       ...(opts.liveActor ? { liveActor: true } : {}),
+      ...(opts.grants ? { grants: opts.grants } : {}),
     },
     SECRET,
   );
@@ -131,6 +136,25 @@ test("an admin's AUTONOMOUS turn (no liveActor) is shown no admin plane — matc
   }
 });
 
+test("a granted autonomous turn discovers only the unattended read family", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(s.base, await capFor("admin-alice", { grants: ["admin.sessions.read"] }));
+    const adminPaths = paths(body).filter((path) => path.startsWith("/v1/admin/"));
+    assert.deepEqual(adminPaths, [
+      "/v1/admin/sessions",
+      "/v1/admin/sessions/:id",
+      "/v1/admin/scopes",
+      "/v1/admin/errors",
+      "/v1/admin/runs",
+      "/v1/admin/whoami",
+    ]);
+    assert.ok(body.guidance.some((guidance: string) => guidance.includes("flag any other admin action")));
+  } finally {
+    await s.close();
+  }
+});
+
 test("discovery requires a capability token", async () => {
   const s = await start();
   try {
@@ -170,6 +194,8 @@ test("the catalog IS the gate: discovery rows with real paths are admitted, unli
   assert.equal(agentApiMatches("POST", "/v1/skills"), true);
   assert.equal(agentApiMatches("PUT", "/v1/skills/abc"), true);
   assert.equal(agentApiMatches("DELETE", "/v1/skills/abc"), true);
+  assert.equal(agentApiMatches("GET", "/v1/skills/abc"), true);
+  assert.equal(agentApiMatches("POST", "/v1/skills/abc/restore"), true);
   assert.equal(agentApiMatches("GET", "/v1/crons/abc"), true);
   assert.equal(agentApiMatches("PUT", "/v1/memory/self"), true);
   assert.equal(agentApiMatches("PUT", "/v1/admin/memory"), true);

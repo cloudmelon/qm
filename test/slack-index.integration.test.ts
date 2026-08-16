@@ -23,6 +23,8 @@ class FakeSlackClient {
   readonly membersByChannel = new Map<string, string[]>();
   readonly messagesByChannel = new Map<string, any[]>();
   readonly membershipFailures = new Set<string>();
+  groupListings = 0;
+  failGroupListing = false;
   private postSequence = 0;
 
   readonly auth = {
@@ -59,15 +61,28 @@ class FakeSlackClient {
       this.channelsById.set(channel, { ...existing, topic: { value: topic, creator: "UBOT" } });
       return { ok: true };
     },
-    setPurpose: async ({ channel, purpose }: { channel: string; purpose: string }) => {
-      this.purposes.push({ channel, purpose });
-      const existing = this.channelsById.get(channel) ?? { id: channel };
-      this.channelsById.set(channel, { ...existing, purpose: { value: purpose, creator: "UBOT" } });
+  };
+  readonly topics: { channel: string; topic: string }[] = [];
+  readonly pinnedByChannel = new Map<string, { ts: string; user: string; text: string }[]>();
+  readonly pins = {
+    list: async ({ channel }: { channel: string }) => ({
+      items: (this.pinnedByChannel.get(channel) ?? []).map((message) => ({ message })),
+    }),
+    add: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+      const lastPost = this.posts.filter((p) => p.channel === channel).at(-1);
+      const pinned = this.pinnedByChannel.get(channel) ?? [];
+      pinned.push({ ts: timestamp, user: "UBOT", text: lastPost?.text ?? "" });
+      this.pinnedByChannel.set(channel, pinned);
+      return { ok: true };
+    },
+    remove: async ({ channel, timestamp }: { channel: string; timestamp: string }) => {
+      this.pinnedByChannel.set(
+        channel,
+        (this.pinnedByChannel.get(channel) ?? []).filter((m) => m.ts !== timestamp),
+      );
       return { ok: true };
     },
   };
-  readonly topics: { channel: string; topic: string }[] = [];
-  readonly purposes: { channel: string; purpose: string }[] = [];
   readonly chat = {
     postMessage: async (body: any) => {
       this.posts.push(body);
@@ -110,6 +125,10 @@ class FakeSlackClient {
     }
     if (method === "conversations.list") {
       const types = String(args.types ?? "");
+      if (types === "mpim") {
+        this.groupListings++;
+        if (this.failGroupListing) throw new Error("missing mpim:read");
+      }
       yield {
         channels: [...this.channelsById.values()].filter((c) => (types === "mpim" ? c.is_mpim : !c.is_mpim)),
       };
@@ -192,12 +211,24 @@ class FakeCore implements SlackCoreClient {
   readonly polled: string[] = [];
   private runGate: Promise<void> | undefined;
   private releaseRun: (() => void) | undefined;
+  readonly modelChangeListeners: Array<(scope: any) => void> = [];
+  readonly headerPinChangeListeners: Array<(scope: any) => void> = [];
+  readonly headerPinScopes = new Set<string>();
 
   async externalSlackParticipants(): Promise<boolean> {
     return this.externalParticipants;
   }
-  async effectiveModelName(): Promise<string> {
-    return "Claude Opus 4.8";
+  async surfaceHeaderFacts(): Promise<{ agentLabel?: string; modelName: string }> {
+    return { agentLabel: "Quartermaster", modelName: "Claude Opus 4.8" };
+  }
+  onScopeModelChanged(listener: (scope: any) => void): void {
+    this.modelChangeListeners.push(listener);
+  }
+  async channelHeaderPinEnabled(scope: any): Promise<boolean> {
+    return this.headerPinScopes.has(String(scope));
+  }
+  onChannelHeaderPinChanged(listener: (scope: any) => void): void {
+    this.headerPinChangeListeners.push(listener);
   }
   async stageBlob(bytes: Uint8Array): Promise<{ blobId: string; sizeBytes: number }> {
     return { blobId: "blob-1", sizeBytes: bytes.byteLength };
@@ -379,6 +410,7 @@ test("a DM becomes one scoped live turn and one Slack reply", async () => {
     assert.equal(f.core.turns[0].deliveryTarget, "D1");
     assert.equal(f.core.turns[0].liveActor, true);
     assert.equal(f.core.turns[0].triggerTs, "100.1");
+    assert.equal(f.core.turns[0].gatewayContext.botHandle, "qmbot");
     assert.equal(f.core.ackPicks.length, 1);
     assert.equal(f.core.ackPicks[0]?.text, "hello agent");
     assert.ok((f.core.ackPicks[0]?.candidates.length ?? 0) > 0);
@@ -399,7 +431,7 @@ test("a human's DM sets the conversation header to the serving model + web surfa
     assert.deepEqual(f.client.topics, [
       {
         channel: "D1",
-        topic: "Model: Claude Opus 4.8 · https://claw.example.dev/contexts?scope=personal%3AU1",
+        topic: "Using Claude Opus 4.8 here. <https://claw.example.dev/contexts?scope=personal%3AU1|More settings>",
       },
     ]);
     await f.app.emitMessage({ channel: "D1", channel_type: "im", user: "U1", text: "again", ts: "100.2" });
@@ -410,20 +442,97 @@ test("a human's DM sets the conversation header to the serving model + web surfa
   }
 });
 
-test("a channel's description names the channel's own default model and project page", async () => {
+test("joining a channel posts the welcome and a pinned header naming the model and project page", async () => {
+  const f = await fixture({ webUiPublicUrl: "https://claw.example.dev" });
+  try {
+    f.core.headerPinScopes.add("channel:C1");
+    await f.app.emitEvent("member_joined_channel", { user: "UBOT", channel: "C1", event_ts: "100.1" }, "Ev-bot-join");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(
+      f.client.pinnedByChannel.get("C1")?.map((m) => m.text),
+      ["Using Claude Opus 4.8 here. <https://claw.example.dev/projects/channel/C1|More settings>"],
+    );
+    assert.deepEqual(f.client.topics, [], "a channel's topic stays the members' own scratch space");
+  } finally {
+    await f.stop();
+  }
+});
+
+test("joining a channel with the toggle off (the default) posts only the welcome — no pin", async () => {
+  const f = await fixture({ webUiPublicUrl: "https://claw.example.dev" });
+  try {
+    await f.app.emitEvent("member_joined_channel", { user: "UBOT", channel: "C1", event_ts: "100.1" }, "Ev-bot-join");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.client.posts.length, 1, "only the welcome message lands");
+    assert.equal(f.client.pinnedByChannel.get("C1"), undefined);
+  } finally {
+    await f.stop();
+  }
+});
+
+test("flipping the toggle on creates the pinned header; flipping it off removes it", async () => {
+  const f = await fixture({ webUiPublicUrl: "https://claw.example.dev" });
+  try {
+    assert.equal(f.core.headerPinChangeListeners.length, 1, "the plugin subscribes to toggle changes");
+    f.core.headerPinScopes.add("channel:C1");
+    for (const listener of f.core.headerPinChangeListeners) listener("channel:C1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(
+      f.client.pinnedByChannel.get("C1")?.map((m) => m.text),
+      ["Using Claude Opus 4.8 here. <https://claw.example.dev/projects/channel/C1|More settings>"],
+      "toggle-on posts and pins the header",
+    );
+    f.core.headerPinScopes.delete("channel:C1");
+    for (const listener of f.core.headerPinChangeListeners) listener("channel:C1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(f.client.pinnedByChannel.get("C1"), [], "toggle-off unpins the header");
+    assert.equal(f.client.deletes.length, 1, "and deletes the bot's header message");
+  } finally {
+    await f.stop();
+  }
+});
+
+test("a mention in a channel with no pinned header never creates one", async () => {
   const f = await fixture({ webUiPublicUrl: "https://claw.example.dev" });
   try {
     const mention = { channel: "C1", channel_type: "channel", user: "U1", text: "<@UBOT> hi", ts: "100.1" };
     f.client.messagesByChannel.set("C1", [mention]);
     await f.app.emitEvent("app_mention", mention, "Ev-channel-header");
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(f.client.purposes, [
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.client.pinnedByChannel.get("C1"), undefined);
+    assert.deepEqual(f.client.updates, []);
+  } finally {
+    await f.stop();
+  }
+});
+
+test("a scope's model change rewrites its channel's pinned header without waiting for a message", async () => {
+  const f = await fixture({ webUiPublicUrl: "https://claw.example.dev" });
+  try {
+    assert.equal(f.core.modelChangeListeners.length, 1, "the plugin subscribes to core's model changes");
+    f.core.headerPinScopes.add("channel:C1");
+    f.client.pinnedByChannel.set("C1", [
       {
-        channel: "C1",
-        purpose: "Model: Claude Opus 4.8 · https://claw.example.dev/contexts?scope=channel%3AC1",
+        ts: "50.0",
+        user: "UBOT",
+        text: "Using Claude Sonnet 5 here. <https://claw.example.dev/projects/channel/C1|More settings>",
       },
     ]);
-    assert.deepEqual(f.client.topics, [], "a channel's topic stays the members' own scratch space");
+    for (const listener of f.core.modelChangeListeners) listener("channel:C1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(
+      f.client.updates.map((u) => ({ channel: u.channel, ts: u.ts, text: u.text })),
+      [
+        {
+          channel: "C1",
+          ts: "50.0",
+          text: "Using Claude Opus 4.8 here. <https://claw.example.dev/projects/channel/C1|More settings>",
+        },
+      ],
+    );
+    for (const listener of f.core.modelChangeListeners) listener("personal:alice@example.com");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(f.client.topics, [], "a DM's topic settles on the person's next message, not on a push");
   } finally {
     await f.stop();
   }
@@ -642,6 +751,82 @@ test("a group-DM thread-follow runs unprompted yet attests its author's liveness
     assert.equal(f.core.turns[0].liveActor, true, "a member's own verbatim follow-up is a live act");
     assert.equal(f.core.turns[0].conversation.kind, "group");
     assert.equal(f.core.turns[0].conversation.threadRef, "grp:G1:300.1");
+  } finally {
+    await f.stop();
+  }
+});
+
+test("a message from an unseen group DM resyncs the directory so it becomes addressable", async () => {
+  const f = await fixture();
+  try {
+    f.client.channelsById.set("G9", { id: "G9", name: "", is_member: true, is_private: true, is_mpim: true });
+    f.client.membersByChannel.set("G9", ["U1", "U2", "UBOT"]);
+    const listedBefore = f.client.groupListings;
+    await f.app.emitMessage({ channel: "G9", channel_type: "mpim", user: "U1", text: "hi", ts: "400.1" });
+    await waitFor(() => f.client.groupListings > listedBefore);
+    await waitFor(() => (f.core.directories.at(-1)?.groupMembers ?? []).some((g: any) => g.groupId === "G9"));
+    assert.deepEqual(
+      f.core.directories
+        .at(-1)
+        .groupMembers.filter((g: any) => g.groupId === "G9")
+        .map((g: any) => g.principalId)
+        .sort(),
+      ["U1", "U2"],
+      "the new group's internal roster reaches core, bot excluded",
+    );
+
+    const listedAfter = f.client.groupListings;
+    await f.app.emitMessage({ channel: "G9", channel_type: "mpim", user: "U1", text: "again", ts: "400.2" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.client.groupListings, listedAfter, "a group DM already seen does not resync on every message");
+  } finally {
+    await f.stop();
+  }
+});
+
+test("a failed group listing pushes its fallback rows under the OLD stamp, never a fresh one", async () => {
+  const f = await fixture();
+  try {
+    f.client.channelsById.set("G7", { id: "G7", name: "", is_member: true, is_private: true, is_mpim: true });
+    f.client.membersByChannel.set("G7", ["U1", "U2", "UBOT"]);
+    await f.app.emitMessage({ channel: "G7", channel_type: "mpim", user: "U1", text: "hi", ts: "402.1" });
+    await waitFor(() =>
+      f.core.directories.some((d: any) => (d.groupMembers ?? []).some((g: any) => g.groupId === "G7")),
+    );
+    const goodStamp = f.core.directories.findLast((d: any) => d.groupsSyncedAt !== undefined).groupsSyncedAt;
+    assert.ok(goodStamp > 0);
+
+    f.client.failGroupListing = true;
+    f.client.channelsById.set("G6", { id: "G6", name: "", is_member: true, is_private: true, is_mpim: true });
+    await f.app.emitMessage({ channel: "G6", channel_type: "mpim", user: "U1", text: "hi", ts: "402.2" });
+    await waitFor(() => f.core.directories.findLast((d: any) => d.channels)?.channelsSyncedAt > goodStamp);
+    const last = f.core.directories.findLast((d: any) => d.channels);
+    assert.equal(
+      last.groupMembers,
+      undefined,
+      "a failed group listing must omit the groups section, never ship rows under a fresh stamp",
+    );
+  } finally {
+    await f.stop();
+  }
+});
+
+test("a group DM whose listing fails is retried at most once, never once per message", async () => {
+  const f = await fixture();
+  try {
+    f.client.channelsById.set("G8", { id: "G8", name: "", is_member: true, is_private: true, is_mpim: true });
+    f.client.membersByChannel.set("G8", ["U1", "U2", "UBOT"]);
+    f.client.failGroupListing = true;
+    const listedBefore = f.client.groupListings;
+    for (const ts of ["401.1", "401.2", "401.3"]) {
+      await f.app.emitMessage({ channel: "G8", channel_type: "mpim", user: "U1", text: "hi", ts });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(
+      f.client.groupListings - listedBefore,
+      1,
+      "a failing listing must not make every message trigger another full sync",
+    );
   } finally {
     await f.stop();
   }

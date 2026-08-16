@@ -29,15 +29,17 @@ import {
 } from "./core-bridge";
 import { UI_BASE } from "./deep-link";
 import { errMessage } from "../../chassis/src/errors";
-import { actionSnippet, closeFormMenus, formatBytes, icon, initials, relTime, toggleFormMenu } from "./ui";
-import { appState, renderSidebarTop, replacePanePreservingFocus, switchView, syncUrlFromState } from "./shell";
-import { newChat } from "./chat";
+import { actionSnippet, closeFormMenus, fieldSelect, formatBytes, icon, initials, relTime, toggleFormMenu } from "./ui";
+import { appState, replacePanePreservingFocus, switchView, syncUrlFromState } from "./shell";
+import { mainConversation } from "./conversations";
 import { groupDmTitle, openSession, refreshSessions, sessionsState, slackLogo, surfaceOf } from "./sessions";
 import { activityOf } from "./session-list";
 import type { CronView } from "./crons";
 import { cronRunSummary, cronRunSummaryTitle, cronScheduleSummary } from "./cron-format";
 import { restoreDialogFocus } from "./dialog-focus";
-import { ambientPolicyApplies, ambientPolicySection, loadAmbientPolicy, resetAmbientPolicy } from "./ambient-policy";
+import { ambientPolicySection, loadAmbientPolicy, resetAmbientPolicy } from "./ambient-policy";
+import { contextModelSection, loadContextModel, resetContextModel } from "./context-model";
+import { channelHeaderSection, loadChannelHeader, resetChannelHeader } from "./channel-header";
 
 interface ScopeFile {
   id: string;
@@ -94,6 +96,10 @@ export const contextsState = {
   memberBusy: false,
   memberError: "",
   memberSearchedQuery: "",
+  slackEditing: false,
+  slackValue: "",
+  slackBusy: false,
+  slackError: "",
 };
 
 let contextsLoading = false;
@@ -148,6 +154,10 @@ export function resetContextsState(): void {
   contextsState.memberBusy = false;
   contextsState.memberError = "";
   contextsState.memberSearchedQuery = "";
+  contextsState.slackEditing = false;
+  contextsState.slackValue = "";
+  contextsState.slackBusy = false;
+  contextsState.slackError = "";
   cancelMemberSearchTimer();
   contextsNotice = "";
   memberSearchSeq++;
@@ -180,6 +190,8 @@ export async function renderContexts(): Promise<void> {
   ) {
     void loadScopeResources(contextsState.selected);
     void loadAmbientPolicy(contextsState.selected, drawContexts);
+    void loadContextModel(contextsState.selected, drawContexts);
+    void loadChannelHeader(contextsState.selected, drawContexts);
   }
   drawContexts();
 }
@@ -224,6 +236,18 @@ export function personalScopeId(): string | null {
   return contextsState.list.find((c) => c.kind === "personal")?.scopeId ?? null;
 }
 
+export function resolveProjectScope(contexts: readonly CoreContext[], slug: string): string | null {
+  if (slug.startsWith("channel:") || slug.startsWith("group:")) {
+    return contexts.some((context) => context.scopeId === slug) ? slug : null;
+  }
+  const normalized = slug.toLowerCase();
+  const matches = contexts.filter((context) => {
+    const match = /^personal:([^@]+)@/.exec(context.scopeId);
+    return match?.[1]?.toLowerCase() === normalized;
+  });
+  return matches.length === 1 ? matches[0]!.scopeId : null;
+}
+
 function metaForScope(scopeId: string | null, fallbackName?: string | null): { title: string; glyph: IconNode } {
   const c = scopeId ? contextsState.list.find((x) => x.scopeId === scopeId) : undefined;
   if (c) {
@@ -235,6 +259,10 @@ function metaForScope(scopeId: string | null, fallbackName?: string | null): { t
   if (scopeId?.startsWith("personal:") && scopeId !== personalScopeId())
     return { title: "Shared personal space", glyph: User };
   return { title: fallbackName?.trim() || "Personal", glyph: User };
+}
+
+export function scopeTitle(scopeId: string | null, fallbackName?: string | null): string {
+  return metaForScope(scopeId, fallbackName).title;
 }
 
 export function scopeChip(scopeId: string | null, fallbackName?: string | null): TemplateResult {
@@ -311,14 +339,32 @@ function gridTpl(): TemplateResult {
         Boolean(context.sessionCount))
     );
   };
-  const rank = (context: CoreContext) => {
-    if (context.kind === "personal") return 0;
-    return context.project ? 1 : 2;
+  const projects = contextsState.list.filter(matches);
+  const groupOf = (context: CoreContext) => {
+    if (context.kind === "personal") return "personal";
+    return context.project ? "web" : "slack";
   };
-  const projects = contextsState.list.filter(matches).sort((a, b) => rank(a) - rank(b));
+  const groups = [
+    { key: "personal", label: "Personal" },
+    { key: "web", label: "Web" },
+    { key: "slack", label: "Slack" },
+  ]
+    .map((g) => ({ ...g, items: projects.filter((context) => groupOf(context) === g.key) }))
+    .filter((g) => g.items.length > 0);
   const projectsFiltered = Boolean(q);
   let projectList: TemplateResult | typeof nothing = nothing;
-  if (projects.length) projectList = html`<div class="grid project-grid">${projects.map(contextCard)}</div>`;
+  if (projects.length)
+    projectList = html`<div class="project-list">
+      ${groups.map(
+        (g) =>
+          html`<section class="project-group">
+            <div class="project-group-head">
+              ${g.label} <span class="project-group-count">· ${g.items.length}</span>
+            </div>
+            ${g.items.map(contextRow)}
+          </section>`,
+      )}
+    </div>`;
   else if (!contextsLoading) {
     projectList = html`<div class="empty compact project-empty">
       ${projectsFiltered ? "No projects match your search." : "No projects yet."}
@@ -364,18 +410,15 @@ function gridTpl(): TemplateResult {
             }}
         /></label>
         <label class="list-select"
-          ><span>Show</span
-          ><select
-            .value=${contextsWorkspaceFilter}
-            @change=${(event: Event) => {
-              contextsWorkspaceFilter = (event.currentTarget as HTMLSelectElement)
-                .value as typeof contextsWorkspaceFilter;
+          ><span>Show</span>${fieldSelect({
+            compact: true,
+            value: contextsWorkspaceFilter,
+            onChange: (value) => {
+              contextsWorkspaceFilter = value as typeof contextsWorkspaceFilter;
               drawContexts();
-            }}
-          >
-            <option value="active">Active only</option>
-            <option value="all">Everything</option>
-          </select></label
+            },
+            options: [html`<option value="active">Active only</option>`, html`<option value="all">Everything</option>`],
+          })}</label
         >
       </div>
       ${status ? html`<div class="status">${status}</div>` : nothing} ${projectList}
@@ -384,22 +427,18 @@ function gridTpl(): TemplateResult {
   `;
 }
 
-function contextCard(c: CoreContext): TemplateResult {
+function contextRow(c: CoreContext): TemplateResult {
   const { title, sub, glyph } = contextMeta(c);
   const count = c.sessionCount === 1 ? "1 conversation" : `${c.sessionCount} conversations`;
-  let access = "shared";
-  if (c.project && isProjectOwner(c)) access = "owned";
-  else if (c.kind === "personal") access = "private";
+  const meta = [c.project ? sub : "", count, c.lastActivityAt ? `active ${relTime(c.lastActivityAt)}` : ""]
+    .filter(Boolean)
+    .join(" · ");
   return html`
-    <button class="card context-card" type="button" @click=${() => selectContext(c.scopeId)}>
-      <div class="card-head">
-        <span class="context-glyph">${icon(glyph, 17)}</span>
-        <h2 class="card-title">${title}</h2>
-        ${c.isPrivate ? html`<span class="context-lock" title="Private channel">${icon(Lock, 13)}</span>` : nothing}
-        <span class="badge">${access}</span>
-      </div>
-      <div class="card-meta context-card-sub">${sub}</div>
-      <div class="card-meta">${count}${c.lastActivityAt ? ` · active ${relTime(c.lastActivityAt)}` : ""}</div>
+    <button class="context-row" type="button" title=${sub} @click=${() => selectContext(c.scopeId)}>
+      <span class="context-glyph">${icon(glyph, 15)}</span>
+      <span class="context-row-title">${title}</span>
+      ${c.isPrivate ? html`<span class="context-lock" title="Private channel">${icon(Lock, 12)}</span>` : nothing}
+      <span class="context-row-meta">${meta}</span>
     </button>
   `;
 }
@@ -407,7 +446,6 @@ function contextCard(c: CoreContext): TemplateResult {
 function detailTpl(c: CoreContext): TemplateResult {
   const { title, sub, glyph } = contextMeta(c);
   const sessions = sessionsIn(c.scopeId);
-  const hasSettings = Boolean(c.project) || ambientPolicyApplies(c.scopeId);
   const completelyEmpty = sessions.length === 0 && scopeResourcesEmpty(c.scopeId);
   return html`
     <div class="context-detail">
@@ -438,7 +476,7 @@ function detailTpl(c: CoreContext): TemplateResult {
           </button>
         </div>
       </div>
-      <div class=${`context-workspace ${hasSettings ? "has-settings" : ""}`}>
+      <div class="context-workspace has-settings">
         <div class="context-workspace-main">
           ${
             completelyEmpty
@@ -468,13 +506,10 @@ function detailTpl(c: CoreContext): TemplateResult {
                 `
           }
         </div>
-        ${
-          hasSettings
-            ? html`<aside class="context-settings" aria-label=${c.project ? "Project settings" : "Context settings"}>
-                ${c.project ? projectMembersSection(c) : nothing} ${ambientPolicySection(c.scopeId)}
-              </aside>`
-            : nothing
-        }
+        <aside class="context-settings" aria-label=${c.project ? "Project settings" : "Context settings"}>
+          ${c.project ? projectMembersSection(c) : nothing} ${c.project ? projectSlackSection(c) : nothing}
+          ${contextModelSection(c.scopeId)} ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}
+        </aside>
       </div>
     </div>
   `;
@@ -501,6 +536,182 @@ function memberLabel(context: CoreContext, principalId: string): string {
   return context.project?.members.find((member) => member.principalId === principalId)?.displayName || principalId;
 }
 
+function channelNameOptions(): string[] {
+  return [
+    ...new Set(
+      contextsState.list
+        .filter((c) => c.kind === "channel" && c.name)
+        .map((c) => c.name!.replace(/^#/, ""))
+        .sort(),
+    ),
+  ];
+}
+
+async function linkProjectSlackChannel(context: CoreContext): Promise<void> {
+  const channel = contextsState.slackValue.trim().replace(/^#/, "");
+  if (!context.project || contextsState.slackBusy || !channel) return;
+  const resetSeq = contextsResetSeq;
+  contextsState.slackBusy = true;
+  contextsState.slackError = "";
+  drawContexts();
+  try {
+    const response = await api(`/api/projects/${encodeURIComponent(context.project.id)}/slack-channel`, {
+      method: "PUT",
+      body: JSON.stringify({ channel }),
+    });
+    if (resetSeq !== contextsResetSeq) return;
+    const project = projectFromResponse(response);
+    if (!project) throw new Error("Core returned an invalid project");
+    upsertProject(project);
+    contextsState.slackEditing = false;
+    contextsState.slackValue = "";
+  } catch (error) {
+    if (resetSeq !== contextsResetSeq) return;
+    contextsState.slackError = errMessage(error, "Couldn't link that channel — you must be a member of it.");
+  } finally {
+    if (resetSeq === contextsResetSeq) {
+      contextsState.slackBusy = false;
+      drawContexts();
+    }
+  }
+}
+
+async function unlinkProjectSlackChannel(context: CoreContext): Promise<void> {
+  const linked = context.project?.slackChannel;
+  if (!context.project || !linked || contextsState.slackBusy) return;
+  if (!window.confirm(`Unlink #${linked.channelName} from ${context.name || "this project"}?`)) return;
+  const resetSeq = contextsResetSeq;
+  contextsState.slackBusy = true;
+  contextsState.slackError = "";
+  drawContexts();
+  try {
+    const response = await api(`/api/projects/${encodeURIComponent(context.project.id)}/slack-channel`, {
+      method: "DELETE",
+    });
+    if (resetSeq !== contextsResetSeq) return;
+    const project = projectFromResponse(response);
+    if (!project) throw new Error("Core returned an invalid project");
+    upsertProject(project);
+  } catch (error) {
+    if (resetSeq !== contextsResetSeq) return;
+    contextsState.slackError = errMessage(error, "Couldn't unlink the channel.");
+  } finally {
+    if (resetSeq === contextsResetSeq) {
+      contextsState.slackBusy = false;
+      drawContexts();
+    }
+  }
+}
+
+function projectSlackLinked(context: CoreContext): TemplateResult {
+  const linked = context.project!.slackChannel!;
+  return html`
+    <div class="project-member-row">
+      <span class="context-glyph" aria-hidden="true">${icon(Hash, 15)}</span>
+      <span class="project-member-name">${linked.channelName}</span>
+      <button
+        class="project-icon-button danger"
+        type="button"
+        aria-label=${`Unlink #${linked.channelName}`}
+        title=${`Unlink #${linked.channelName}`}
+        ?disabled=${contextsState.slackBusy}
+        @click=${() => void unlinkProjectSlackChannel(context)}
+      >
+        ${icon(X, 15)}
+      </button>
+    </div>
+    <p class="context-hint">
+      The agent posts this project's updates to #${linked.channelName}, and everyone in the channel is in the project.
+    </p>
+  `;
+}
+
+function projectSlackEditor(context: CoreContext): TemplateResult {
+  const options = channelNameOptions();
+  return html`
+    <form
+      class="project-slack-form"
+      @submit=${(e: Event) => {
+        e.preventDefault();
+        void linkProjectSlackChannel(context);
+      }}
+    >
+      <div class="project-member-search-row">
+        ${icon(Hash, 16)}
+        <input
+          type="text"
+          data-focus-key="project-slack-channel"
+          autocomplete="off"
+          maxlength="200"
+          placeholder="channel name"
+          list="project-slack-channels"
+          aria-label="Slack channel to link"
+          .value=${contextsState.slackValue}
+          ?disabled=${contextsState.slackBusy}
+          @input=${(e: Event) => {
+            contextsState.slackValue = (e.target as HTMLInputElement).value;
+          }}
+        />
+      </div>
+      <datalist id="project-slack-channels">${options.map((name) => html`<option value=${name}></option>`)}</datalist>
+      <div class="project-slack-actions">
+        <button class="btn primary" type="submit" ?disabled=${contextsState.slackBusy}>Link</button>
+        <button
+          class="btn"
+          type="button"
+          ?disabled=${contextsState.slackBusy}
+          @click=${() => {
+            contextsState.slackEditing = false;
+            contextsState.slackValue = "";
+            contextsState.slackError = "";
+            drawContexts();
+          }}
+        >
+          Cancel
+        </button>
+      </div>
+    </form>
+  `;
+}
+
+function projectSlackIdle(): TemplateResult {
+  return html`
+    <button
+      class="btn project-slack-link"
+      type="button"
+      ?disabled=${contextsState.slackBusy}
+      @click=${() => {
+        contextsState.slackEditing = true;
+        contextsState.slackError = "";
+        drawContexts();
+      }}
+    >
+      ${icon(Hash, 15)}<span>Link a channel</span>
+    </button>
+    <p class="context-hint">
+      Give this project a home channel on Slack — the agent will post updates there, and everyone in the channel joins
+      the project.
+    </p>
+  `;
+}
+
+function projectSlackSection(context: CoreContext): TemplateResult {
+  const project = context.project!;
+  let body: TemplateResult;
+  if (project.slackChannel) body = projectSlackLinked(context);
+  else if (contextsState.slackEditing) body = projectSlackEditor(context);
+  else body = projectSlackIdle();
+  return html`
+    <section class="context-panel project-slack" aria-labelledby="project-slack-title">
+      <div class="context-panel-heading">
+        <h2 class="context-panel-title" id="project-slack-title">Slack channel</h2>
+      </div>
+      ${body}
+      ${contextsState.slackError ? html`<div class="project-member-status error" aria-live="polite">${contextsState.slackError}</div>` : nothing}
+    </section>
+  `;
+}
+
 function projectMembersSection(context: CoreContext): TemplateResult {
   const project = context.project!;
   const pickerOpen = contextsState.memberProjectId === project.id;
@@ -513,13 +724,21 @@ function projectMembersSection(context: CoreContext): TemplateResult {
       <div class="project-member-list">
         ${projectPeople(context).map((principalId) => {
           const label = memberLabel(context, principalId);
+          const viaChannel = Boolean(project.members.find((member) => member.principalId === principalId)?.viaChannel);
           return html`
             <div class="project-member-row">
               <span class="project-member-avatar" aria-hidden="true">${initials(label)}</span>
               <span class="project-member-name">${label}</span>
               ${principalId === project.ownerId ? html`<span class="badge">Owner</span>` : nothing}
               ${
-                isProjectOwner(context) && principalId !== project.ownerId
+                viaChannel && project.slackChannel
+                  ? html`<span class="badge" title="Joined via the linked Slack channel"
+                      >#${project.slackChannel.channelName}</span
+                    >`
+                  : nothing
+              }
+              ${
+                isProjectOwner(context) && principalId !== project.ownerId && !viaChannel
                   ? html`<button
                       class="project-icon-button danger"
                       type="button"
@@ -990,6 +1209,10 @@ function toggleMemberPicker(context: CoreContext): void {
   contextsState.memberSearching = false;
   contextsState.memberError = "";
   contextsState.memberSearchedQuery = "";
+  contextsState.slackEditing = false;
+  contextsState.slackValue = "";
+  contextsState.slackBusy = false;
+  contextsState.slackError = "";
   drawContexts();
   if (contextsState.memberProjectId)
     queueMicrotask(() => document.querySelector<HTMLInputElement>("#project-member-search")?.focus());
@@ -1004,6 +1227,10 @@ function closeMemberPicker(): void {
   contextsState.memberSearching = false;
   contextsState.memberError = "";
   contextsState.memberSearchedQuery = "";
+  contextsState.slackEditing = false;
+  contextsState.slackValue = "";
+  contextsState.slackBusy = false;
+  contextsState.slackError = "";
   drawContexts();
 }
 
@@ -1015,6 +1242,10 @@ function scheduleMemberSearch(context: CoreContext): void {
   contextsState.memberSearching = false;
   contextsState.memberError = "";
   contextsState.memberSearchedQuery = "";
+  contextsState.slackEditing = false;
+  contextsState.slackValue = "";
+  contextsState.slackBusy = false;
+  contextsState.slackError = "";
   const query = contextsState.memberQuery.trim();
   if (query.length < 2) {
     if (hadVisibleState || contextsState.memberMatches.length) {
@@ -1189,26 +1420,32 @@ function selectContext(scopeId: string | null): void {
   contextsState.memberSearching = false;
   contextsState.memberError = "";
   contextsState.memberSearchedQuery = "";
+  contextsState.slackEditing = false;
+  contextsState.slackValue = "";
+  contextsState.slackBusy = false;
+  contextsState.slackError = "";
   contextsState.selected = scopeId;
   contextsState.resources = null;
   contextsState.resourcesScope = null;
   contextsState.resourcesNotice = "";
   contextsState.resourcesLoading = false;
   resetAmbientPolicy();
+  resetContextModel();
+  resetChannelHeader();
   syncUrlFromState();
   drawContexts();
   if (scopeId) {
     void loadScopeResources(scopeId);
     void loadAmbientPolicy(scopeId, drawContexts);
+    void loadContextModel(scopeId, drawContexts);
+    void loadChannelHeader(scopeId, drawContexts);
   }
 }
 
 function startChatIn(c: CoreContext): void {
-  newChat(c.kind === "personal" ? undefined : { scopeId: c.scopeId, name: c.name });
+  mainConversation().newChat(c.kind === "personal" ? undefined : { scopeId: c.scopeId, name: c.name });
 }
 
 async function openFromContext(s: CoreSession): Promise<void> {
-  appState.currentView = "chats";
-  renderSidebarTop();
   await openSession(s);
 }

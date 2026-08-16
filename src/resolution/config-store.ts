@@ -19,6 +19,7 @@ import {
   type PublicConnectorClient,
   type DecryptedConnectorClient,
 } from "../connectors/connector-client-store.ts";
+import { errMessage } from "../util/errors.ts";
 
 export interface PersistedSoul {
   scopeId: ScopeId;
@@ -63,10 +64,14 @@ export interface PersistedBaseModel {
   harnessId?: string;
   orgRevision?: number;
   revision?: number;
+  effortLevel?: string;
+  fastMode?: boolean;
 }
 interface RuntimeSelection {
   harnessId: string;
   modelId: string;
+  effortLevel?: string;
+  fastMode?: boolean;
 }
 interface ScopedRuntimeSelection extends RuntimeSelection {
   orgRevision: number;
@@ -88,6 +93,7 @@ export interface OrgBranding {
   accent?: string;
   mark?: string;
   selfLabel?: string;
+  orgName?: string;
 }
 export interface PersistedBranding {
   scopeId: ScopeId;
@@ -154,6 +160,12 @@ export interface ScopedConfigStore {
   setExternalSlackParticipants(id: ScopeId, on: boolean): void;
   clearExternalSlackParticipants(id: ScopeId): void;
   getExternalSlackParticipantsDurable(id: ScopeId): Promise<boolean>;
+  getChannelHeaderPin(id: ScopeId): boolean;
+  setChannelHeaderPinLatest(id: ScopeId, on: boolean | null): Promise<void>;
+  getChannelHeaderPinDurable(id: ScopeId): Promise<boolean>;
+  getChannelHeaderPinOverrideDurable(id: ScopeId): Promise<boolean | null>;
+  getChannelHeaderPinDefaultDurable(): Promise<boolean>;
+  onChannelHeaderPinChanged(listener: (id: ScopeId) => void): void;
   getBaseModel(id: ScopeId): string | null;
   setBaseModel(id: ScopeId, modelId: string | null): void;
   getRuntimeSelection(id: ScopeId): ScopedRuntimeSelection | null;
@@ -162,6 +174,7 @@ export interface ScopedConfigStore {
   acknowledgeRuntimeSelection(id: ScopeId): void;
   acknowledgeRuntimeSelectionLatest(id: ScopeId): Promise<void>;
   getRuntimeSelectionDurable(id: ScopeId): Promise<ScopedRuntimeSelection | null>;
+  onRuntimeSelectionChanged(listener: (id: ScopeId) => void): void;
   getApprovedHarnesses(): string[] | null;
   setApprovedHarnesses(ids: string[] | null): void;
   getApprovedHarnessesDurable(): Promise<string[] | null>;
@@ -209,6 +222,7 @@ export function createMemoryConfigStore(
     egressPolicies?: DurableMap<PersistedEgressPolicy>;
     unfulfilledInsights?: DurableMap<PersistedScopedFlag>;
     externalSlackParticipants?: DurableMap<PersistedScopedFlag>;
+    channelHeaderPin?: DurableMap<PersistedScopedFlag>;
     baseModels?: DurableMap<PersistedBaseModel>;
     approvedHarnesses?: DurableMap<PersistedApprovedHarnesses>;
     orgAmbient?: DurableMap<PersistedScopedFlag>;
@@ -233,6 +247,7 @@ export function createMemoryConfigStore(
   const egress = new Map<ScopeId, EgressPolicy>();
   const unfulfilledInsights = new Map<ScopeId, boolean>();
   const externalSlackParticipants = new Map<ScopeId, boolean>();
+  const channelHeaderPin = new Map<ScopeId, boolean>();
   const baseModels = new Map<ScopeId, PersistedBaseModel>();
   let approvedHarnesses: string[] | null = null;
   let orgAmbient = true;
@@ -251,6 +266,7 @@ export function createMemoryConfigStore(
   const egressStore = opts.egressPolicies ?? createMemoryMap<PersistedEgressPolicy>();
   const unfulfilledInsightsStore = opts.unfulfilledInsights ?? createMemoryMap<PersistedScopedFlag>();
   const externalSlackParticipantsStore = opts.externalSlackParticipants ?? createMemoryMap<PersistedScopedFlag>();
+  const channelHeaderPinStore = opts.channelHeaderPin ?? createMemoryMap<PersistedScopedFlag>();
   const baseModelStore = opts.baseModels ?? createMemoryMap<PersistedBaseModel>();
   const approvedHarnessStore = opts.approvedHarnesses ?? createMemoryMap<PersistedApprovedHarnesses>();
   const orgAmbientStore = opts.orgAmbient ?? createMemoryMap<PersistedScopedFlag>();
@@ -262,7 +278,8 @@ export function createMemoryConfigStore(
   const browseModelStore = opts.browseModels ?? createMemoryMap<PersistedBrowseModel>();
   const turnWallClockStore = opts.turnWallClocks ?? createMemoryMap<PersistedTurnWallClock>();
   const deploymentIdentity = opts.deploymentIdentity ?? createMemoryMap<PersistedDeploymentIdentity>();
-  const persistWarn = (what: string) => (e: unknown) => console.error(`[config] failed to persist ${what}:`, e);
+  const persistWarn = (what: string) => (e: unknown) =>
+    console.error(`[config] failed to persist ${what}:`, errMessage(e));
   const writeQueue = createKeyedQueue();
   const pendingWrites = new Map<string, Promise<void>>();
   const persist = (key: string, what: string, op: () => Promise<unknown>): void => {
@@ -273,6 +290,26 @@ export function createMemoryConfigStore(
     });
     pendingWrites.set(key, pending);
     void pending.catch(persistWarn(what));
+  };
+  const channelHeaderPinListeners = new Set<(id: ScopeId) => void>();
+  const noteChannelHeaderPinChanged = (id: ScopeId): void => {
+    for (const listener of channelHeaderPinListeners) {
+      try {
+        listener(id);
+      } catch (e) {
+        console.error("[config] channel-header-pin listener failed:", errMessage(e));
+      }
+    }
+  };
+  const runtimeSelectionListeners = new Set<(id: ScopeId) => void>();
+  const noteRuntimeSelectionChanged = (id: ScopeId): void => {
+    for (const listener of runtimeSelectionListeners) {
+      try {
+        listener(id);
+      } catch (e) {
+        console.error("[config] runtime-selection listener failed:", errMessage(e));
+      }
+    }
   };
   const connectorClients = opts.connectorClients ?? createMemoryMap<StoredConnectorClient>();
   const connectorKey = deriveConnectorKey(opts.connectorSecretKey ?? randomBytes(32), "connector-clients");
@@ -380,6 +417,7 @@ export function createMemoryConfigStore(
           for (const r of await egressStore.all()) egress.set(r.scopeId, r.policy);
           for (const r of await unfulfilledInsightsStore.all()) unfulfilledInsights.set(r.scopeId, r.on);
           for (const r of await externalSlackParticipantsStore.all()) externalSlackParticipants.set(r.scopeId, r.on);
+          for (const r of await channelHeaderPinStore.all()) channelHeaderPin.set(r.scopeId, r.on);
           for (const r of await baseModelStore.all()) baseModels.set(r.scopeId, r);
           approvedHarnesses = (await approvedHarnessStore.get(org))?.ids ?? null;
           orgAmbient = (await orgAmbientStore.get(org))?.on ?? true;
@@ -618,6 +656,24 @@ export function createMemoryConfigStore(
     getExternalSlackParticipantsDurable: async (id) =>
       ((await externalSlackParticipantsStore.get(org))?.on ?? false) ||
       ((await externalSlackParticipantsStore.get(id))?.on ?? false),
+    getChannelHeaderPin: (id) => channelHeaderPin.get(id) ?? channelHeaderPin.get(org) ?? false,
+    async setChannelHeaderPinLatest(id, on) {
+      await writeQueue(`channelHeaderPin:${id}`, async () => {
+        if (on === null) await channelHeaderPinStore.delete(id);
+        else await channelHeaderPinStore.put(id, { scopeId: id, on });
+        if (on === null) channelHeaderPin.delete(id);
+        else channelHeaderPin.set(id, on);
+      });
+      noteChannelHeaderPinChanged(id);
+    },
+    getChannelHeaderPinDurable: async (id) =>
+      (await channelHeaderPinStore.get(id))?.on ??
+      (id === org ? false : ((await channelHeaderPinStore.get(org))?.on ?? false)),
+    getChannelHeaderPinOverrideDurable: async (id) => (await channelHeaderPinStore.get(id))?.on ?? null,
+    getChannelHeaderPinDefaultDurable: async () => (await channelHeaderPinStore.get(org))?.on ?? false,
+    onChannelHeaderPinChanged(listener) {
+      channelHeaderPinListeners.add(listener);
+    },
     getBaseModel: (id) => baseModels.get(id)?.modelId ?? null,
     setBaseModel(id, modelId) {
       if (modelId === null) {
@@ -631,6 +687,7 @@ export function createMemoryConfigStore(
         baseModels.set(id, row);
         persist(`model:${id}`, "base model", () => baseModelStore.put(id, row));
       }
+      noteRuntimeSelectionChanged(id);
     },
     getRuntimeSelection(id) {
       const row = baseModels.get(id);
@@ -640,12 +697,15 @@ export function createMemoryConfigStore(
         modelId: row.modelId,
         orgRevision: row.orgRevision ?? 0,
         ...(row.revision !== undefined ? { revision: row.revision } : {}),
+        ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel } : {}),
+        ...(row.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
       };
     },
     setRuntimeSelection(id, selection) {
       if (selection === null) {
         baseModels.delete(id);
         persist(`model:${id}`, "runtime selection", () => baseModelStore.delete(id));
+        noteRuntimeSelectionChanged(id);
         return;
       }
       const orgRow = baseModels.get(org);
@@ -656,6 +716,7 @@ export function createMemoryConfigStore(
           : { scopeId: id, ...selection, orgRevision: orgRow?.revision ?? 0 };
       baseModels.set(id, row);
       persist(`model:${id}`, "runtime selection", () => baseModelStore.put(id, row));
+      noteRuntimeSelectionChanged(id);
     },
     async setRuntimeSelectionLatest(id, selection) {
       await writeQueue(`model:${id}`, async () => {
@@ -673,6 +734,7 @@ export function createMemoryConfigStore(
         await baseModelStore.put(id, row);
         baseModels.set(id, row);
       });
+      noteRuntimeSelectionChanged(id);
     },
     acknowledgeRuntimeSelection(id) {
       const row = baseModels.get(id);
@@ -692,6 +754,9 @@ export function createMemoryConfigStore(
         baseModels.set(id, next);
       });
     },
+    onRuntimeSelectionChanged(listener) {
+      runtimeSelectionListeners.add(listener);
+    },
     getRuntimeSelectionDurable: async (id) => {
       const row = await baseModelStore.get(id);
       if (!row?.harnessId) return null;
@@ -700,6 +765,8 @@ export function createMemoryConfigStore(
         modelId: row.modelId,
         orgRevision: row.orgRevision ?? 0,
         ...(row.revision !== undefined ? { revision: row.revision } : {}),
+        ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel } : {}),
+        ...(row.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
       };
     },
     getApprovedHarnesses: () => (approvedHarnesses ? [...approvedHarnesses] : null),
@@ -875,6 +942,7 @@ export function createMemoryConfigStore(
         brandingRow,
         orgAmbientRow,
         interactiveFastModeRow,
+        channelHeaderPinRow,
       ] = await Promise.all([
         soulStore.get(id),
         commandPolicyStore.get(id),
@@ -888,6 +956,7 @@ export function createMemoryConfigStore(
         brandingStore.get(id),
         id === org ? orgAmbientStore.get(org) : null,
         id === org ? interactiveFastModeStore.get(org) : null,
+        channelHeaderPinStore.get(id),
       ]);
       let refreshedSoul = soul;
       const legacyHistory = legacySoulHistory.get(id) ?? [];
@@ -928,6 +997,8 @@ export function createMemoryConfigStore(
       if (id === org) interactiveFastMode = interactiveFastModeRow?.on ?? false;
       if (brandingRow) branding.set(id, brandingRow.branding);
       else branding.delete(id);
+      if (channelHeaderPinRow) channelHeaderPin.set(id, channelHeaderPinRow.on);
+      else channelHeaderPin.delete(id);
     },
     async flushScope(id) {
       const keys = [
@@ -941,6 +1012,8 @@ export function createMemoryConfigStore(
         `turnWallClock:${id}`,
         `branding:${id}`,
         ...(id === org ? [`approvedHarnesses:${org}`, `orgAmbient:${org}`, `interactiveFastMode:${org}`] : []),
+        `channelHeaderPin:${id}`,
+        ...(id === org ? [`approvedHarnesses:${org}`, `orgAmbient:${org}`] : []),
       ];
       await Promise.all(
         keys.map(async (key) => {

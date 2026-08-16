@@ -27,13 +27,19 @@ export function registerSlackEvents(
     ids: BotIdentity;
     deduper: ReturnType<typeof createDeduper>;
     webUiPublicUrl?: string;
-    ensureHeader?: (client: SurfaceHeaderClient, channel: string, scopeId: string, kind: "dm" | "channel") => void;
+    ensureHeader?: (
+      client: SurfaceHeaderClient,
+      channel: string,
+      scopeId: string,
+      kind: "dm" | "channel",
+      ensureOpts?: { pinNew?: boolean },
+    ) => void;
   },
 ): void {
   const { handler, mirror, directory, ids, deduper } = deps;
   const { dispatch, handleReactionEvent, botHasStakeInThread } = handler;
   const { mirrorMessageEvent, pushSurfaceEvents } = mirror;
-  const { knownPublicChannels, forceDirectorySync } = directory;
+  const { knownPublicChannels, syncForUnseenGroup, forceDirectorySync } = directory;
 
   app.event("app_mention", async ({ event, body, client, context }: any) => {
     const e = event as any;
@@ -126,6 +132,7 @@ export function registerSlackEvents(
     }
 
     if (m.channel_type === "channel" || m.channel_type === "group" || m.channel_type === "mpim") {
+      if (m.channel_type === "mpim" && m.channel) syncForUnseenGroup(client, String(m.channel));
       const threadReply = isThreadReply(m);
       const isMention = mentionsBot(m.text ?? "", ids.botUserId);
       const willDispatch = threadReply && !isMention && (await botHasStakeInThread(client, m.channel, m.thread_ts));
@@ -183,7 +190,9 @@ export function registerSlackEvents(
         ...(deps.ensureHeader
           ? {
               ensureHeader: (channel: string) =>
-                deps.ensureHeader!(client as SurfaceHeaderClient, channel, `channel:${channel}`, "channel"),
+                deps.ensureHeader!(client as SurfaceHeaderClient, channel, `channel:${channel}`, "channel", {
+                  pinNew: true,
+                }),
             }
           : {}),
       });
@@ -191,6 +200,16 @@ export function registerSlackEvents(
       await forceDirectorySync(client);
     }
   });
+
+  for (const evt of ["channel_created", "channel_rename", "channel_unarchive"] as const) {
+    app.event(evt, async ({ event, body, client }: any) => {
+      const e = event as { channel?: { id?: string } | string; event_ts?: string };
+      const channel = typeof e.channel === "string" ? e.channel : e.channel?.id;
+      if (deduper.seen(dedupeKey({ event_id: (body as { event_id?: string })?.event_id, channel, ts: e.event_ts })))
+        return;
+      await forceDirectorySync(client);
+    });
+  }
 
   app.event("member_left_channel", async ({ event, body, client }: any) => {
     const e = event as { channel?: string; event_ts?: string };
